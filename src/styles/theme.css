@@ -119,6 +119,49 @@
   --color-sidebar-ring: var(--sidebar-ring);
 }
 
+.high-contrast {
+  --foreground: #000000;
+  --background: #FFFFFF;
+  --card: #FFFFFF;
+  --card-foreground: #000000;
+  --muted-foreground: #333333;
+  --border: #000000;
+  --primary: #002B5C;
+  --secondary: #FFE8A3;
+  --secondary-foreground: #000000;
+}
+
+.high-contrast.dark {
+  --foreground: #FFFFFF;
+  --background: #000000;
+  --card: #000000;
+  --card-foreground: #FFFFFF;
+  --muted-foreground: #E5E5E5;
+  --border: #FFFFFF;
+  --primary: #7FD1FF;
+  --primary-foreground: #000000;
+  --secondary: #4A3B00;
+  --secondary-foreground: #FFFFFF;
+}
+
+.high-contrast * {
+  border-color: var(--border) !important;
+}
+
+.reduce-motion *,
+.reduce-motion *::before,
+.reduce-motion *::after {
+  animation-duration: 0.001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
+}
+
+.larger-touch-targets button,
+.larger-touch-targets a {
+  min-height: 44px;
+  min-width: 44px;
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;
