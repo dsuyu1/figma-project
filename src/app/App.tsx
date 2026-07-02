@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   MapPin, Search, Calendar, Plus, ChevronRight, Star, Heart,
   Bookmark, DollarSign, Users, Map, Compass, Wallet, User,
@@ -6,13 +6,30 @@ import {
   ArrowLeft, Camera, Coffee, CheckCircle, Circle, GripVertical,
   TrendingUp, PieChart, SplitSquareHorizontal, Crown, Shield,
   Eye, ChevronDown, Thermometer, Wind, Sun, X, Check, Edit3,
-  Navigation, Layers, Moon, Gear, Trash2, Info
+  Navigation, Layers, Moon, Gear, Trash2, Info, Sparkles, Send
 } from "lucide-react";
 import { PieChart as RechartsPie, Pie, Cell, ResponsiveContainer, BarChart, Bar, XAxis, Tooltip } from "recharts";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
-type Tab = "explore" | "trips" | "discover" | "budget" | "friends";
+type Tab = "explore" | "trips" | "discover" | "budget" | "friends" | "assistant";
+
+type AiPlan = {
+  destination: string;
+  dates: string;
+  summary: string;
+  budget: number;
+  days: { title: string; items: string[] }[];
+};
+
+type ChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  text?: string;
+  plan?: AiPlan;
+  planStatus?: "pending" | "accepted" | "rejected";
+  typing?: boolean;
+};
 
 type ToastItem = {
   id: string;
@@ -265,6 +282,258 @@ const QUICK_ADD_TYPES = [
 
 function genId() {
   return Math.random().toString(36).slice(2);
+}
+
+// ─── AI Assistant data & logic ───────────────────────────────────────────────
+
+const AI_GRADIENT = "linear-gradient(135deg, #6366F1 0%, #A855F7 55%, #EC4899 100%)";
+
+const EXAMPLE_PROMPTS: { label: string; icon: React.ElementType; color: string }[] = [
+  { label: "Best places to eat in Jakarta", icon: Utensils, color: "#FF6B4A" },
+  { label: "3 day itinerary to Jakarta", icon: Calendar, color: "#2EC4B6" },
+  { label: "Top attractions in Jakarta", icon: Camera, color: "#6366F1" },
+];
+
+// A small knowledge base so the example prompts feel authentic; any other city
+// falls back to sensible generic suggestions built from the destination name.
+const CITY_DATA: Record<string, { food: string[]; attractions: string[]; hotels: string[] }> = {
+  jakarta: {
+    food: [
+      "Sate Khas Senayan — iconic Indonesian satay and grilled classics",
+      "Kaum Jakarta — refined heritage recipes from across the archipelago",
+      "Nasi Goreng Kebon Sirih — legendary late-night fried rice cart",
+      "Pantjoran Tea House (Glodok) — dim sum and tea in old Chinatown",
+    ],
+    attractions: [
+      "National Monument (Monas) — the city's landmark tower and park",
+      "Kota Tua (Old Town) — Dutch colonial squares and museums",
+      "Istiqlal Mosque — Southeast Asia's largest mosque",
+      "Taman Mini Indonesia Indah — the whole country in one park",
+    ],
+    hotels: [
+      "Hotel Indonesia Kempinski — luxury in the heart of the city",
+      "The Hermitage, Menteng — elegant colonial-era charm",
+      "Ashley Wahid Hasyim — stylish, central mid-range pick",
+    ],
+  },
+  kyoto: {
+    food: [
+      "Kikunoi Roan — exquisite traditional kaiseki in Gion",
+      "Nishiki Market — a covered arcade of street food stalls",
+      "% Arabica Higashiyama — famous specialty coffee with river views",
+      "Ippudo Nishikikoji — comforting Kyoto-style tonkotsu ramen",
+    ],
+    attractions: [
+      "Fushimi Inari-taisha — thousands of vermilion torii gates",
+      "Arashiyama Bamboo Grove — a soaring green corridor",
+      "Kinkaku-ji — the shimmering Golden Pavilion",
+      "Gion District — historic streets and geisha culture",
+    ],
+    hotels: [
+      "Park Hyatt Kyoto — serene luxury in Higashiyama",
+      "Nishiki Ryokan — a classic ryokan stay in Gion",
+      "The Thousand Kyoto — sleek and central by the station",
+    ],
+  },
+};
+
+function titleCase(s: string) {
+  return s.replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+const DEST_STOPWORDS = new Set(["I", "The", "Best", "Top", "Day", "Days", "Trip", "Plan", "Places", "Things", "Where"]);
+
+// Words that end a place phrase, and verbs that must not be mistaken for a
+// place when they follow "to" (e.g. "to eat", "to see").
+const PLACE_STOP = new Set([
+  "for", "this", "next", "over", "during", "on", "in", "to", "the", "a", "an",
+  "and", "with", "please", "trip", "itinerary", "plan", "plans", "days", "day",
+]);
+const VERB_AFTER_TO = new Set([
+  "eat", "see", "do", "go", "stay", "visit", "drink", "shop", "relax", "travel",
+  "fly", "explore", "find", "book", "spend",
+]);
+
+function capturePlaceAfter(words: string[], startIdx: number): string {
+  const parts: string[] = [];
+  for (let i = startIdx; i < words.length && parts.length < 3; i++) {
+    if (PLACE_STOP.has(words[i].toLowerCase())) break;
+    parts.push(words[i]);
+  }
+  return parts.join(" ").trim();
+}
+
+function extractDestination(q: string): string {
+  const words = q.replace(/[?.!,]/g, " ").split(/\s+/).filter(Boolean);
+  const primaryPreps = new Set(["in", "at", "near", "around", "visiting"]);
+
+  // "in/at/near/around <place>" — these almost always precede a real place.
+  for (let i = 0; i < words.length; i++) {
+    if (primaryPreps.has(words[i].toLowerCase())) {
+      const cand = capturePlaceAfter(words, i + 1);
+      if (cand) return titleCase(cand);
+    }
+  }
+  // "visit <place>"
+  for (let i = 0; i < words.length; i++) {
+    if (words[i].toLowerCase() === "visit") {
+      const cand = capturePlaceAfter(words, i + 1);
+      if (cand) return titleCase(cand);
+    }
+  }
+  // "to <place>" — but skip "to eat", "to see", etc.
+  for (let i = 0; i < words.length; i++) {
+    if (words[i].toLowerCase() === "to" && i + 1 < words.length && !VERB_AFTER_TO.has(words[i + 1].toLowerCase())) {
+      const cand = capturePlaceAfter(words, i + 1);
+      if (cand) return titleCase(cand);
+    }
+  }
+  // Fallback: last capitalized word that isn't a common query word.
+  const caps = (q.match(/\b[A-Z][a-zA-Z]+\b/g) ?? []).filter((w) => !DEST_STOPWORDS.has(w));
+  if (caps.length) return caps[caps.length - 1];
+  return "your destination";
+}
+
+const NUMBER_WORDS: Record<string, number> = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7 };
+
+function extractDays(q: string): number {
+  const digit = q.match(/(\d+)\s*[-\s]?\s*day/i);
+  if (digit) return Math.min(Math.max(parseInt(digit[1], 10), 1), 7);
+  const word = q.toLowerCase().match(/\b(one|two|three|four|five|six|seven)\b\s*[-\s]?\s*day/);
+  if (word) return NUMBER_WORDS[word[1]];
+  return 3;
+}
+
+function bulletList(items: string[]): string {
+  return items.map((i) => `•  ${i}`).join("\n");
+}
+
+function restaurantsText(dest: string): string {
+  const data = CITY_DATA[dest.toLowerCase()];
+  const items = data?.food ?? [
+    `A beloved local restaurant serving the classic dishes of ${dest}`,
+    `A lively night market — the best spot for street food in ${dest}`,
+    "A rooftop restaurant with skyline views and modern cuisine",
+    "A cozy neighborhood café for slow brunch and great coffee",
+  ];
+  return `Here are some great places to eat in ${dest} 🍽️\n\n${bulletList(items)}\n\nWant me to turn these into a food-focused day plan you can add to your Trips?`;
+}
+
+function attractionsText(dest: string): string {
+  const data = CITY_DATA[dest.toLowerCase()];
+  const items = data?.attractions ?? [
+    `The most iconic landmark in ${dest} — don't miss it`,
+    `The historic old quarter of ${dest}, best explored on foot`,
+    "A top-rated museum or gallery for a rainy afternoon",
+    "A scenic viewpoint that's perfect around sunset",
+  ];
+  return `Top attractions in ${dest} 📸\n\n${bulletList(items)}\n\nAsk me for an itinerary and I'll weave these into a plan for you.`;
+}
+
+function hotelsText(dest: string): string {
+  const data = CITY_DATA[dest.toLowerCase()];
+  const items = data?.hotels ?? [
+    `A standout luxury stay in the heart of ${dest}`,
+    "A charming boutique hotel with character",
+    "A well-reviewed, central mid-range option",
+  ];
+  return `Where to stay in ${dest} 🏨\n\n${bulletList(items)}\n\nLet me know your dates and I can build a full trip around one of these.`;
+}
+
+function generalText(dest: string, q: string): string {
+  if (/\b(hi|hello|hey|help)\b/i.test(q) || q.trim().length < 4) {
+    return "Hi! I'm your travel assistant ✨\n\nTell me where you'd like to go and I can suggest places to eat, top attractions, or build a day-by-day itinerary you can add straight to your Trips.";
+  }
+  return `Great question! For ${dest}, I can help with the best places to eat, top attractions, where to stay, or a full day-by-day itinerary.\n\nTry asking for a "3 day itinerary to ${dest}" and I'll put together a plan you can accept and add to your Trips.`;
+}
+
+function buildPlan(dest: string, days: number): AiPlan {
+  const data = CITY_DATA[dest.toLowerCase()];
+  const attractions = data?.attractions ?? [];
+  const food = data?.food ?? [];
+  const pick = (arr: string[], i: number, fallback: string) => {
+    const raw = arr[i % arr.length];
+    return raw ? raw.split(" — ")[0] : fallback;
+  };
+
+  const dayTemplates: { title: string; build: (i: number) => string[] }[] = [
+    {
+      title: "Arrival & city center",
+      build: () => [
+        `Arrive in ${dest} and check in`,
+        "Wander the historic city center to get your bearings",
+        `Welcome dinner: ${pick(food, 0, "a local favorite restaurant")}`,
+      ],
+    },
+    {
+      title: "Icons & landmarks",
+      build: () => [
+        `Morning: ${pick(attractions, 0, `${dest}'s most famous landmark`)}`,
+        `Lunch near ${pick(attractions, 0, "the old town")}`,
+        `Afternoon: ${pick(attractions, 1, "a top museum or gallery")}`,
+        "Sunset at a scenic viewpoint",
+      ],
+    },
+    {
+      title: "Local life & flavors",
+      build: () => [
+        `Explore a local market — ${pick(food, 1, "street food heaven")}`,
+        `Visit ${pick(attractions, 2, "a cultural highlight")}`,
+        "Relax at a neighborhood café",
+        `Farewell dinner: ${pick(food, 2, "a memorable dining spot")}`,
+      ],
+    },
+    {
+      title: "Day trip & nature",
+      build: () => [
+        `Half-day trip just outside ${dest}`,
+        "Time in nature — gardens, coast, or hills",
+        `Evening back in ${dest} at a rooftop bar`,
+      ],
+    },
+    {
+      title: "Hidden gems",
+      build: () => [
+        "Discover an off-the-beaten-path neighborhood",
+        "Browse boutiques and pick up souvenirs",
+        `Dinner at ${pick(food, 3, "a spot the locals love")}`,
+      ],
+    },
+    { title: "Relax & recharge", build: () => ["Slow morning and brunch", "Spa, park, or beach time", "Casual local dinner"] },
+    { title: "Last-day highlights", build: () => ["Revisit your favorite spot", "Last-minute shopping", "Farewell meal before departure"] },
+  ];
+
+  const planDays = Array.from({ length: days }, (_, i) => {
+    const t = dayTemplates[i] ?? dayTemplates[dayTemplates.length - 1];
+    return { title: `Day ${i + 1} · ${t.title}`, items: t.build(i) };
+  });
+
+  return {
+    destination: dest === "your destination" ? "Your Trip" : dest,
+    dates: `${days} days · flexible`,
+    summary: `A balanced ${days}-day plan for ${dest === "your destination" ? "your trip" : dest}, mixing must-see highlights with food and downtime.`,
+    budget: 800 + days * 400,
+    days: planDays,
+  };
+}
+
+function generateAiResponse(q: string): { text?: string; plan?: AiPlan } {
+  const lower = q.toLowerCase();
+  const dest = extractDestination(q);
+
+  if (/(itinerary|day plan|\bplan\b|schedule|\d+\s*[-\s]?\s*day|(?:one|two|three|four|five|six|seven)\s*[-\s]?\s*day)/.test(lower)) {
+    return { plan: buildPlan(dest, extractDays(q)) };
+  }
+  if (/(eat|food|restaurant|dining|dinner|lunch|breakfast|cuisine|cafe|coffee|drink)/.test(lower)) {
+    return { text: restaurantsText(dest) };
+  }
+  if (/(attraction|things to do|sights?|see|landmark|museum|explore|top places|do in)/.test(lower)) {
+    return { text: attractionsText(dest) };
+  }
+  if (/(hotel|stay|accommodation|where to stay|lodging|resort)/.test(lower)) {
+    return { text: hotelsText(dest) };
+  }
+  return { text: generalText(dest, q) };
 }
 
 // ─── Utility components ──────────────────────────────────────────────────────
@@ -1680,6 +1949,282 @@ function FriendsScreen({ pushToast }: { pushToast: (t: Omit<ToastItem, "id">) =>
   );
 }
 
+// ─── Screen: AI Assistant ─────────────────────────────────────────────────────
+
+function TypingDots() {
+  return (
+    <div className="inline-flex items-center gap-1 bg-card border border-border rounded-2xl rounded-tl-md px-4 py-3.5">
+      {[0, 1, 2].map((i) => (
+        <span
+          key={`dot-${i}`}
+          className="w-1.5 h-1.5 rounded-full bg-muted-foreground/60 animate-bounce"
+          style={{ animationDelay: `${i * 0.15}s` }}
+        />
+      ))}
+    </div>
+  );
+}
+
+function PlanCard({
+  plan,
+  status,
+  onAccept,
+  onReject,
+}: {
+  plan: AiPlan;
+  status?: "pending" | "accepted" | "rejected";
+  onAccept: () => void;
+  onReject: () => void;
+}) {
+  return (
+    <div className="rounded-2xl border border-border overflow-hidden bg-card shadow-sm">
+      <div className="p-4 text-white" style={{ background: "linear-gradient(135deg, #1A3F6F, #2EC4B6)" }}>
+        <div className="flex items-center gap-1.5 mb-1">
+          <MapPin size={14} />
+          <p className="font-display font-semibold text-sm">{plan.destination}</p>
+        </div>
+        <p className="text-xs text-white/80">{plan.dates} · est. ${plan.budget.toLocaleString()}</p>
+      </div>
+      <div className="p-4 space-y-3">
+        <p className="text-xs text-muted-foreground leading-relaxed">{plan.summary}</p>
+        {plan.days.map((d, i) => (
+          <div key={`plan-day-${i}`}>
+            <div className="flex items-center gap-2 mb-1">
+              <span className="w-5 h-5 rounded-full bg-primary/10 text-primary text-[10px] font-bold flex items-center justify-center flex-shrink-0">
+                {i + 1}
+              </span>
+              <p className="text-xs font-semibold text-foreground">{d.title.replace(/^Day \d+ · /, "")}</p>
+            </div>
+            <ul className="pl-7 space-y-0.5">
+              {d.items.map((it, j) => (
+                <li key={`plan-item-${i}-${j}`} className="text-[11px] text-muted-foreground list-disc marker:text-primary/50">
+                  {it}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
+      </div>
+      {status === "pending" && (
+        <div className="flex gap-2 p-3 border-t border-border">
+          <button
+            onClick={onReject}
+            className="flex-1 flex items-center justify-center gap-1.5 rounded-xl py-2.5 text-xs font-semibold bg-muted text-muted-foreground hover:bg-muted/70 transition-colors"
+          >
+            <X size={13} />
+            Reject
+          </button>
+          <button
+            onClick={onAccept}
+            className="flex-1 flex items-center justify-center gap-1.5 rounded-xl py-2.5 text-xs font-semibold text-white hover:opacity-90 transition-opacity"
+            style={{ background: AI_GRADIENT }}
+          >
+            <Check size={13} />
+            Accept plan
+          </button>
+        </div>
+      )}
+      {status === "accepted" && (
+        <div className="flex items-center justify-center gap-1.5 p-3 border-t border-border text-xs font-semibold text-green-600 bg-green-50">
+          <CheckCircle size={14} />
+          Added to your Trips
+        </div>
+      )}
+      {status === "rejected" && (
+        <div className="flex items-center justify-center gap-1.5 p-3 border-t border-border text-xs font-medium text-muted-foreground bg-muted/40">
+          <X size={14} />
+          Plan dismissed
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MessageBubble({
+  message,
+  onAccept,
+  onReject,
+}: {
+  message: ChatMessage;
+  onAccept: () => void;
+  onReject: () => void;
+}) {
+  if (message.role === "user") {
+    return (
+      <div className="flex justify-end">
+        <div className="max-w-[80%] bg-primary text-primary-foreground rounded-2xl rounded-br-md px-4 py-2.5 text-sm leading-relaxed">
+          {message.text}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex gap-2">
+      <div
+        className="w-7 h-7 rounded-xl flex items-center justify-center flex-shrink-0 mt-0.5"
+        style={{ background: AI_GRADIENT }}
+      >
+        <Sparkles size={13} className="text-white" />
+      </div>
+      <div className="flex-1 min-w-0 space-y-2">
+        {message.typing ? (
+          <TypingDots />
+        ) : (
+          <>
+            {message.text && (
+              <div className="bg-card border border-border rounded-2xl rounded-tl-md px-4 py-3 text-sm text-foreground whitespace-pre-wrap leading-relaxed">
+                {message.text}
+              </div>
+            )}
+            {message.plan && (
+              <PlanCard plan={message.plan} status={message.planStatus} onAccept={onAccept} onReject={onReject} />
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AssistantEmptyState({ onPick }: { onPick: (prompt: string) => void }) {
+  return (
+    <div className="flex flex-col">
+      <div className="flex flex-col items-center text-center pt-4 pb-6">
+        <div
+          className="w-16 h-16 rounded-3xl flex items-center justify-center mb-4 shadow-lg"
+          style={{ background: AI_GRADIENT, boxShadow: "0 8px 24px rgba(139,92,246,0.35)" }}
+        >
+          <Sparkles size={30} className="text-white" />
+        </div>
+        <h2 className="font-display text-xl font-semibold text-foreground mb-1">How can I help you plan?</h2>
+        <p className="text-sm text-muted-foreground max-w-[280px]">
+          Ask me anything about your next trip — I'll suggest places and build plans you can add straight to your Trips.
+        </p>
+      </div>
+
+      <p className="text-xs font-semibold text-muted-foreground mb-2.5">Don't know what to ask? Try these examples:</p>
+      <div className="space-y-2">
+        {EXAMPLE_PROMPTS.map(({ label, icon: Icon, color }) => (
+          <button
+            key={`example-${label}`}
+            onClick={() => onPick(label)}
+            className="w-full flex items-center gap-3 bg-card border border-border rounded-2xl px-4 py-3 text-left hover:shadow-md hover:border-primary/30 transition-all duration-200"
+          >
+            <div className="w-8 h-8 rounded-xl flex items-center justify-center flex-shrink-0" style={{ background: `${color}18` }}>
+              <Icon size={15} style={{ color }} />
+            </div>
+            <span className="text-sm font-medium text-foreground flex-1">{label}</span>
+            <ChevronRight size={15} className="text-muted-foreground flex-shrink-0" />
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function AssistantScreen({
+  messages,
+  onSend,
+  onAcceptPlan,
+  onRejectPlan,
+  onReset,
+}: {
+  messages: ChatMessage[];
+  onSend: (text: string) => void;
+  onAcceptPlan: (id: string) => void;
+  onRejectPlan: (id: string) => void;
+  onReset: () => void;
+}) {
+  const [input, setInput] = useState("");
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const hasConversation = messages.length > 0;
+
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+  }, [messages]);
+
+  const submit = (text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    onSend(trimmed);
+    setInput("");
+  };
+
+  return (
+    <div className="flex flex-col h-full">
+      {/* Header */}
+      <div className="px-5 pt-12 pb-3 flex-shrink-0 border-b border-border">
+        <div className="flex items-center gap-2.5">
+          <div className="w-9 h-9 rounded-2xl flex items-center justify-center flex-shrink-0" style={{ background: AI_GRADIENT }}>
+            <Sparkles size={18} className="text-white" />
+          </div>
+          <div className="flex-1 min-w-0">
+            <h1 className="font-display text-lg font-semibold text-foreground leading-tight">Travel Assistant</h1>
+            <p className="text-[11px] text-muted-foreground flex items-center gap-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-green-500" />
+              Ready to plan your next trip
+            </p>
+          </div>
+          {hasConversation && (
+            <button
+              onClick={onReset}
+              className="text-[11px] font-semibold text-primary bg-secondary px-3 py-1.5 rounded-xl hover:bg-primary hover:text-primary-foreground transition-colors"
+            >
+              New chat
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Messages */}
+      <div ref={scrollRef} className="flex-1 overflow-y-auto scrollbar-hide px-5 py-4">
+        {hasConversation ? (
+          <div className="space-y-3">
+            {messages.map((m) => (
+              <MessageBubble
+                key={m.id}
+                message={m}
+                onAccept={() => onAcceptPlan(m.id)}
+                onReject={() => onRejectPlan(m.id)}
+              />
+            ))}
+          </div>
+        ) : (
+          <AssistantEmptyState onPick={submit} />
+        )}
+      </div>
+
+      {/* Input */}
+      <div className="flex-shrink-0 px-4 pt-2.5 pb-4 border-t border-border bg-card/80 backdrop-blur-md">
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            submit(input);
+          }}
+          className="flex items-center gap-2"
+        >
+          <input
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder="Ask a travel question…"
+            className="flex-1 bg-input-background rounded-2xl px-4 py-3 text-sm outline-none focus:ring-2 focus:ring-primary/30 transition"
+          />
+          <button
+            type="submit"
+            disabled={!input.trim()}
+            className="w-11 h-11 rounded-2xl flex items-center justify-center flex-shrink-0 disabled:opacity-40 hover:opacity-90 transition-opacity"
+            style={{ background: AI_GRADIENT }}
+            aria-label="Send message"
+          >
+            <Send size={17} className="text-white" />
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 // ─── Bottom Tab Bar ───────────────────────────────────────────────────────────
 
 const TABS: { id: Tab; label: string; icon: typeof Compass }[] = [
@@ -1691,37 +2236,70 @@ const TABS: { id: Tab; label: string; icon: typeof Compass }[] = [
 ];
 
 function TabBar({ active, setActive }: { active: Tab; setActive: (t: Tab) => void }) {
+  const renderTab = ({ id, label, icon: Icon }: (typeof TABS)[number]) => {
+    const isActive = active === id;
+    return (
+      <button
+        key={`tab-${id}`}
+        onClick={() => setActive(id)}
+        className="flex-1 flex flex-col items-center gap-1 py-1.5 transition-all duration-200"
+      >
+        <div
+          className={`w-10 h-8 rounded-xl flex items-center justify-center transition-all duration-200 ${
+            isActive ? "bg-primary/10" : ""
+          }`}
+        >
+          <Icon
+            size={isActive ? 20 : 18}
+            className={`transition-all duration-200 ${isActive ? "text-primary" : "text-muted-foreground"}`}
+            strokeWidth={isActive ? 2.2 : 1.8}
+          />
+        </div>
+        <span
+          className={`text-[9px] font-semibold tracking-wide transition-all duration-200 ${
+            isActive ? "text-primary" : "text-muted-foreground"
+          }`}
+        >
+          {label}
+        </span>
+      </button>
+    );
+  };
+
+  const assistantActive = active === "assistant";
+
   return (
     <div className="flex-shrink-0 flex items-end bg-card/95 backdrop-blur-md border-t border-border px-2 pb-5 pt-2 safe-bottom">
-      {TABS.map(({ id, label, icon: Icon }) => {
-        const isActive = active === id;
-        return (
-          <button
-            key={`tab-${id}`}
-            onClick={() => setActive(id)}
-            className="flex-1 flex flex-col items-center gap-1 py-1.5 transition-all duration-200"
-          >
-            <div
-              className={`w-10 h-8 rounded-xl flex items-center justify-center transition-all duration-200 ${
-                isActive ? "bg-primary/10" : ""
-              }`}
-            >
-              <Icon
-                size={isActive ? 20 : 18}
-                className={`transition-all duration-200 ${isActive ? "text-primary" : "text-muted-foreground"}`}
-                strokeWidth={isActive ? 2.2 : 1.8}
-              />
-            </div>
-            <span
-              className={`text-[9px] font-semibold tracking-wide transition-all duration-200 ${
-                isActive ? "text-primary" : "text-muted-foreground"
-              }`}
-            >
-              {label}
-            </span>
-          </button>
-        );
-      })}
+      {TABS.slice(0, 2).map(renderTab)}
+
+      {/* AI Assistant — gradient action button */}
+      <button
+        onClick={() => setActive("assistant")}
+        className="flex-1 flex flex-col items-center gap-1 py-1.5 transition-all duration-200"
+        aria-label="Open AI travel assistant"
+      >
+        <div
+          className="w-12 h-9 rounded-2xl flex items-center justify-center transition-all duration-200"
+          style={{
+            background: AI_GRADIENT,
+            boxShadow: assistantActive
+              ? "0 6px 18px rgba(139,92,246,0.55)"
+              : "0 3px 10px rgba(139,92,246,0.35)",
+            transform: assistantActive ? "translateY(-2px)" : "none",
+          }}
+        >
+          <Sparkles size={19} className="text-white" strokeWidth={2.2} />
+        </div>
+        <span
+          className={`text-[9px] font-semibold tracking-wide transition-all duration-200 ${
+            assistantActive ? "text-primary" : "text-muted-foreground"
+          }`}
+        >
+          Assistant
+        </span>
+      </button>
+
+      {TABS.slice(2).map(renderTab)}
     </div>
   );
 }
@@ -1781,6 +2359,9 @@ export default function App() {
   // Quick-add modal state
   const [quickAddOpen, setQuickAddOpen] = useState(false);
   const [quickAddType, setQuickAddType] = useState("activity");
+
+  // AI assistant conversation state
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
 
   const pushToast = useCallback((t: Omit<ToastItem, "id">) => {
     const id = genId();
@@ -1901,6 +2482,73 @@ export default function App() {
     setTrips((prev) => [...prev, newTrip]);
   };
 
+  // ─── AI assistant handlers ───────────────────────────────────────────────
+  const handleSendMessage = useCallback((text: string) => {
+    const userMsg: ChatMessage = { id: genId(), role: "user", text };
+    const typingId = genId();
+    setChatMessages((prev) => [...prev, userMsg, { id: typingId, role: "assistant", typing: true }]);
+
+    setTimeout(() => {
+      const response = generateAiResponse(text);
+      setChatMessages((prev) =>
+        prev.map((m) =>
+          m.id === typingId
+            ? {
+                id: typingId,
+                role: "assistant",
+                text: response.text,
+                plan: response.plan,
+                planStatus: response.plan ? "pending" : undefined,
+              }
+            : m
+        )
+      );
+    }, 900);
+  }, []);
+
+  const handleAcceptPlan = useCallback(
+    (msgId: string) => {
+      setChatMessages((prev) => {
+        const msg = prev.find((m) => m.id === msgId);
+        if (msg?.plan && msg.planStatus === "pending") {
+          const plan = msg.plan;
+          const COVER_URLS = [
+            "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=600&h=400&fit=crop&auto=format",
+            "https://images.unsplash.com/photo-1476514525535-07fb3b4ae5f1?w=600&h=400&fit=crop&auto=format",
+            "https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=600&h=400&fit=crop&auto=format",
+          ];
+          const newTrip: Trip = {
+            id: Date.now(),
+            destination: plan.destination,
+            dates: plan.dates,
+            coverUrl: COVER_URLS[Math.floor(Math.random() * COVER_URLS.length)],
+            members: [
+              { name: "You", avatar: "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=64&h=64&fit=crop&auto=format" },
+            ],
+            daysLeft: 90,
+            progress: 10,
+            budget: plan.budget,
+            spent: 0,
+          };
+          setTrips((t) => [...t, newTrip]);
+          pushToast({
+            message: `"${plan.destination}" added to your Trips.`,
+            actionLabel: "View",
+            onAction: () => setActiveTab("trips"),
+          });
+        }
+        return prev.map((m) => (m.id === msgId ? { ...m, planStatus: "accepted" } : m));
+      });
+    },
+    [pushToast]
+  );
+
+  const handleRejectPlan = useCallback((msgId: string) => {
+    setChatMessages((prev) => prev.map((m) => (m.id === msgId ? { ...m, planStatus: "rejected" } : m)));
+  }, []);
+
+  const handleResetChat = useCallback(() => setChatMessages([]), []);
+
   return (
     <div
       className="min-h-screen w-full flex items-center justify-center p-8"
@@ -1928,6 +2576,14 @@ export default function App() {
             {label}
           </button>
         ))}
+        <button
+          onClick={() => setActiveTab("assistant")}
+          className="flex items-center gap-1 px-4 py-1.5 rounded-xl text-xs font-semibold text-white shadow-sm transition-all duration-200 hover:opacity-90"
+          style={{ background: AI_GRADIENT, opacity: activeTab === "assistant" ? 1 : 0.85 }}
+        >
+          <Sparkles size={12} />
+          Assistant
+        </button>
       </div>
 
       <PhoneFrame dark={dark}>
@@ -1959,6 +2615,15 @@ export default function App() {
             {activeTab === "discover" && <DiscoverScreen pushToast={pushToast} />}
             {activeTab === "budget" && <BudgetScreen />}
             {activeTab === "friends" && <FriendsScreen pushToast={pushToast} />}
+            {activeTab === "assistant" && (
+              <AssistantScreen
+                messages={chatMessages}
+                onSend={handleSendMessage}
+                onAcceptPlan={handleAcceptPlan}
+                onRejectPlan={handleRejectPlan}
+                onReset={handleResetChat}
+              />
+            )}
           </div>
           <TabBar active={activeTab} setActive={setActiveTab} />
         </div>
