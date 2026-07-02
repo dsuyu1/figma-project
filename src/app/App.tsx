@@ -539,16 +539,48 @@ function generateAiResponse(q: string): { text?: string; plan?: AiPlan } {
 // ─── Utility components ──────────────────────────────────────────────────────
 
 function Avatar({ src, name, size = 32, ring = false }: { src: string; name: string; size?: number; ring?: boolean }) {
+  const [errored, setErrored] = useState(false);
+  const ringCls = ring ? "ring-2 ring-white" : "";
+  if (!src || errored) {
+    return (
+      <div
+        className={`rounded-full flex-shrink-0 flex items-center justify-center text-white font-semibold ${ringCls}`}
+        style={{ width: size, height: size, fontSize: Math.max(9, Math.round(size * 0.42)), background: "linear-gradient(135deg, #1A3F6F, #2EC4B6)" }}
+        aria-label={name}
+      >
+        {name?.trim()?.[0]?.toUpperCase() ?? "?"}
+      </div>
+    );
+  }
   return (
     <img
       src={src}
       alt={name}
       width={size}
       height={size}
-      className={`rounded-full object-cover flex-shrink-0 ${ring ? "ring-2 ring-white" : ""}`}
+      className={`rounded-full object-cover flex-shrink-0 ${ringCls}`}
       style={{ width: size, height: size }}
+      onError={() => setErrored(true)}
     />
   );
+}
+
+// Renders an image, falling back to an on-brand gradient block if the source
+// fails to load (e.g. offline, or an external host is blocked) — so broken
+// image links never show the browser's broken-image icon.
+function FallbackImage({ src, alt, className, style }: { src?: string; alt?: string; className?: string; style?: React.CSSProperties }) {
+  const [errored, setErrored] = useState(false);
+  if (!src || errored) {
+    return (
+      <div
+        className={className}
+        style={{ ...style, background: "linear-gradient(135deg, #1A3F6F 0%, #2EC4B6 100%)" }}
+        role="img"
+        aria-label={alt}
+      />
+    );
+  }
+  return <img src={src} alt={alt} className={className} style={style} onError={() => setErrored(true)} />;
 }
 
 function StarRating({ rating, reviews }: { rating: number; reviews?: number }) {
@@ -975,7 +1007,7 @@ function ExploreScreen({
               className="flex-shrink-0 w-64 bg-card rounded-2xl overflow-hidden shadow-sm border border-border relative"
             >
               <div className="relative h-32 bg-muted">
-                <img src={trip.coverUrl} alt={trip.destination} className="w-full h-full object-cover" />
+                <FallbackImage src={trip.coverUrl} alt={trip.destination} className="w-full h-full object-cover" />
                 <div className="absolute inset-0 bg-gradient-to-t from-black/60 via-transparent" />
                 <div className="absolute bottom-3 left-3 right-3">
                   <p className="text-white font-display text-sm font-semibold leading-tight">{trip.destination}</p>
@@ -1092,7 +1124,7 @@ function ExploreScreen({
           ].map(({ name, tag, temp, imageUrl }) => (
             <div key={`trending-${name}`} className="flex items-center gap-3 bg-card rounded-xl p-3 border border-border">
               <div className="w-14 h-14 rounded-xl overflow-hidden bg-muted flex-shrink-0">
-                <img src={imageUrl} alt={name} className="w-full h-full object-cover" />
+                <FallbackImage src={imageUrl} alt={name} className="w-full h-full object-cover" />
               </div>
               <div className="flex-1 min-w-0">
                 <p className="text-sm font-semibold text-foreground truncate">{name}</p>
@@ -1178,7 +1210,7 @@ function NewTripModal({ onClose, onCreateTrip }: { onClose: () => void; onCreate
                   className="w-full flex items-center gap-3 p-3 rounded-xl hover:bg-muted/60 transition-colors text-left"
                 >
                   <div className="w-12 h-12 rounded-xl overflow-hidden bg-muted flex-shrink-0">
-                    <img src={s.imageUrl} alt={s.name} className="w-full h-full object-cover" />
+                    <FallbackImage src={s.imageUrl} alt={s.name} className="w-full h-full object-cover" />
                   </div>
                   <div>
                     <p className="text-sm font-semibold text-foreground">{s.name}</p>
@@ -1529,7 +1561,7 @@ function DiscoverScreen({ pushToast }: { pushToast: (t: Omit<ToastItem, "id">) =
 
       {tab === 0 && (
         <div className="mx-5 mb-5 rounded-2xl overflow-hidden relative h-48 bg-muted flex-shrink-0">
-          <img
+          <FallbackImage
             src="https://images.unsplash.com/photo-1493976040374-85c8e12f0c0e?w=700&h=400&fit=crop&auto=format"
             alt="Kyoto"
             className="w-full h-full object-cover"
@@ -1563,7 +1595,7 @@ function DiscoverScreen({ pushToast }: { pushToast: (t: Omit<ToastItem, "id">) =
             return (
               <div key={`discover-item-${i}`} className="bg-card border border-border rounded-2xl overflow-hidden shadow-sm">
                 <div className="relative h-36 bg-muted">
-                  <img src={item.imageUrl} alt={item.name} className="w-full h-full object-cover" />
+                  <FallbackImage src={item.imageUrl} alt={item.name} className="w-full h-full object-cover" />
                   <div className="relative">
                     <button
                       onClick={() => toggleSave(key, item.saved)}
@@ -2557,33 +2589,37 @@ export default function App() {
         fontFamily: "'DM Sans', sans-serif",
       }}
     >
-      {/* Desktop label */}
-      <div className="hidden lg:block absolute top-8 left-8">
-        <p className="font-display text-sm font-semibold text-[#1A3F6F]/60 tracking-wide">Wandr</p>
-        <p className="text-xs text-[#7A8899]">Travel planning, together.</p>
-      </div>
+      {/* Desktop chrome — pinned to the left gutter so it never sits behind
+          the phone mockup, and stays fully clickable */}
+      <div className="hidden lg:flex flex-col gap-4 absolute top-8 left-8 z-[60]">
+        <div>
+          <p className="font-display text-sm font-semibold text-[#1A3F6F]/60 tracking-wide">Wandr</p>
+          <p className="text-xs text-[#7A8899]">Travel planning, together.</p>
+        </div>
 
-      {/* Tab selector for desktop */}
-      <div className="hidden lg:flex absolute top-8 left-1/2 -translate-x-1/2 gap-1 bg-white/60 backdrop-blur-sm rounded-2xl p-1.5 border border-white/80">
-        {TABS.map(({ id, label }) => (
+        {/* Tab selector for desktop */}
+        <div className="flex flex-col gap-1 bg-white/70 backdrop-blur-sm rounded-2xl p-1.5 border border-white/80 shadow-sm w-44">
+          {TABS.map(({ id, label, icon: Icon }) => (
+            <button
+              key={`desktop-tab-${id}`}
+              onClick={() => setActiveTab(id)}
+              className={`flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-semibold transition-all duration-200 ${
+                activeTab === id ? "bg-[#1A3F6F] text-white shadow-sm" : "text-[#7A8899] hover:text-[#1A3F6F] hover:bg-white/60"
+              }`}
+            >
+              <Icon size={14} />
+              {label}
+            </button>
+          ))}
           <button
-            key={`desktop-tab-${id}`}
-            onClick={() => setActiveTab(id)}
-            className={`px-4 py-1.5 rounded-xl text-xs font-semibold transition-all duration-200 ${
-              activeTab === id ? "bg-[#1A3F6F] text-white shadow-sm" : "text-[#7A8899] hover:text-[#1A3F6F]"
-            }`}
+            onClick={() => setActiveTab("assistant")}
+            className="flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-semibold text-white shadow-sm transition-all duration-200 hover:opacity-90"
+            style={{ background: AI_GRADIENT, opacity: activeTab === "assistant" ? 1 : 0.9 }}
           >
-            {label}
+            <Sparkles size={14} />
+            Assistant
           </button>
-        ))}
-        <button
-          onClick={() => setActiveTab("assistant")}
-          className="flex items-center gap-1 px-4 py-1.5 rounded-xl text-xs font-semibold text-white shadow-sm transition-all duration-200 hover:opacity-90"
-          style={{ background: AI_GRADIENT, opacity: activeTab === "assistant" ? 1 : 0.85 }}
-        >
-          <Sparkles size={12} />
-          Assistant
-        </button>
+        </div>
       </div>
 
       <PhoneFrame dark={dark}>
